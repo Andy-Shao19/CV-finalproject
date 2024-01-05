@@ -1,173 +1,246 @@
-import argparse
-import os
+#!/usr/bin/env python
+
 import torch
-from PIL import Image
-from torchvision import transforms
-import torchvision.utils as utils
-from utils.utils import img_resize, load_segment
 import numpy as np
+from PIL import Image
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+class cWCT(torch.nn.Module):
+    def __init__(self, eps=2e-5, use_double=False):
+        super().__init__()
+        self.eps = eps
+        self.use_double = use_double
+
+    def transfer(self, cont_feat, styl_feat, cmask=None, smask=None):
+        if cmask is None or smask is None:
+            return self._transfer(cont_feat, styl_feat)
+        else:
+            return self._transfer_seg(cont_feat, styl_feat, cmask, smask)
+
+    def _transfer(self, cont_feat, styl_feat):
+        """
+        :param cont_feat: [B, N, cH, cW]
+        :param styl_feat: [B, N, sH, sW]
+        :return color_fea: [B, N, cH, cW]
+        """
+        B, N, cH, cW = cont_feat.shape
+        cont_feat = cont_feat.reshape(B, N, -1)
+        styl_feat = styl_feat.reshape(B, N, -1)
+
+        in_dtype = cont_feat.dtype
+        if self.use_double:
+            cont_feat = cont_feat.double()
+            styl_feat = styl_feat.double()
+
+        # whitening and coloring transforms
+        whiten_fea = self.whitening(cont_feat)
+        color_fea = self.coloring(whiten_fea, styl_feat)
+
+        if self.use_double:
+            color_fea = color_fea.to(in_dtype)
+
+        return color_fea.reshape(B, N, cH, cW)
+
+    def _transfer_seg(self, cont_feat, styl_feat, cmask, smask):
+        """
+        :param cont_feat: [B, N, cH, cW]
+        :param styl_feat: [B, N, sH, sW]
+        :param cmask: numpy [B, _, _]
+        :param smask: numpy [B, _, _]
+        :return color_fea: [B, N, cH, cW]
+        """
+        B, N, cH, cW = cont_feat.shape
+        _, _, sH, sW = styl_feat.shape
+        cont_feat = cont_feat.reshape(B, N, -1)
+        styl_feat = styl_feat.reshape(B, N, -1)
+
+        in_dtype = cont_feat.dtype
+        if self.use_double:
+            cont_feat = cont_feat.double()
+            styl_feat = styl_feat.double()
+
+        for i in range(B):
+            label_set, label_indicator = self.compute_label_info(cmask[i], smask[i])
+            resized_content_segment = self.resize(cmask[i], cH, cW)
+            resized_style_segment = self.resize(smask[i], sH, sW)
+
+            single_content_feat = cont_feat[i]     # [N, cH*cW]
+            single_style_feat = styl_feat[i]   # [N, sH*sW]
+            target_feature = single_content_feat.clone()   # [N, cH*cW]
+
+            for label in label_set:
+                if not label_indicator[label]:
+                    continue
+
+                content_index = self.get_index(resized_content_segment, label).to(single_content_feat.device)
+                style_index = self.get_index(resized_style_segment, label).to(single_style_feat.device)
+                if content_index is None or style_index is None:
+                    continue
+
+                masked_content_feat = torch.index_select(single_content_feat, 1, content_index)
+                masked_style_feat = torch.index_select(single_style_feat, 1, style_index)
+                whiten_fea = self.whitening(masked_content_feat)
+                _target_feature = self.coloring(whiten_fea, masked_style_feat)
+
+                new_target_feature = torch.transpose(target_feature, 1, 0)
+                new_target_feature.index_copy_(0, content_index,
+                                               torch.transpose(_target_feature, 1, 0))
+                target_feature = torch.transpose(new_target_feature, 1, 0)
+
+            cont_feat[i] = target_feature
+        color_fea = cont_feat
+
+        if self.use_double:
+            color_fea = color_fea.to(in_dtype)
+
+        return color_fea.reshape(B, N, cH, cW)
+
+    def cholesky_dec(self, conv, invert=False):
+        cholesky = torch.linalg.cholesky if torch.__version__ >= '1.8.0' else torch.cholesky
+        try:
+            L = cholesky(conv)
+        except RuntimeError:
+            # print("Warning: Cholesky Decomposition fails")
+            iden = torch.eye(conv.shape[-1]).to(conv.device)
+            eps = self.eps
+            while True:
+                try:
+                    conv = conv + iden * eps
+                    L = cholesky(conv)
+                    break
+                except RuntimeError:
+                    eps = eps+self.eps
+
+        if invert:
+            L = torch.inverse(L)
+
+        return L.to(conv.dtype)
+
+    def whitening(self, x):
+        mean = torch.mean(x, -1)
+        mean = mean.unsqueeze(-1).expand_as(x)
+        x = x - mean
+
+        conv = (x @ x.transpose(-1, -2)).div(x.shape[-1] - 1)
+        inv_L = self.cholesky_dec(conv, invert=True)
+
+        whiten_x = inv_L @ x
+
+        return whiten_x
+
+    def coloring(self, whiten_xc, xs):
+        xs_mean = torch.mean(xs, -1)
+        xs = xs - xs_mean.unsqueeze(-1).expand_as(xs)
+
+        conv = (xs @ xs.transpose(-1, -2)).div(xs.shape[-1] - 1)
+        Ls = self.cholesky_dec(conv, invert=False)
+
+        coloring_cs = Ls @ whiten_xc
+        coloring_cs = coloring_cs + xs_mean.unsqueeze(-1).expand_as(coloring_cs)
+
+        return coloring_cs
+
+    def compute_label_info(self, cont_seg, styl_seg):
+        if cont_seg.size is False or styl_seg.size is False:
+            return
+        max_label = np.max(cont_seg) + 1
+        self.label_set = np.unique(cont_seg)
+        self.label_indicator = np.zeros(max_label)
+        for l in self.label_set:
+            is_valid = lambda a, b: a > 10 and b > 10 and a / b < 100 and b / a < 100
+            o_cont_mask = np.where(cont_seg.reshape(cont_seg.shape[0] * cont_seg.shape[1]) == l)
+            o_styl_mask = np.where(styl_seg.reshape(styl_seg.shape[0] * styl_seg.shape[1]) == l)
+            self.label_indicator[l] = is_valid(o_cont_mask[0].size, o_styl_mask[0].size)
+        return self.label_set, self.label_indicator
+
+    def resize(self, img, H, W):
+        size = (W, H)
+        if len(img.shape) == 2:
+            return np.array(Image.fromarray(img).resize(size, Image.NEAREST))
+        else:
+            return np.array(Image.fromarray(img, mode='RGB').resize(size, Image.NEAREST))
+
+    def get_index(self, feat, label):
+        mask = np.where(feat.reshape(feat.shape[0] * feat.shape[1]) == label)
+        if mask[0].size <= 0:
+            return None
+        return torch.LongTensor(mask[0])
+
+    def interpolation(self, cont_feat, styl_feat_list, alpha_s_list, alpha_c=0.0):
+        """
+        :param cont_feat: Tensor [B, N, cH, cW]
+        :param styl_feat_list: List [Tensor [B, N, _, _], Tensor [B, N, _, _], ...]
+        :param alpha_s_list: List [float, float, ...]
+        :param alpha_c: float
+        :return color_fea: Tensor [B, N, cH, cW]
+        """
+        assert len(styl_feat_list) == len(alpha_s_list)
+
+        B, N, cH, cW = cont_feat.shape
+        cont_feat = cont_feat.reshape(B, N, -1)
+
+        in_dtype = cont_feat.dtype
+        if self.use_double:
+            cont_feat = cont_feat.double()
+
+        c_mean = torch.mean(cont_feat, -1)
+        cont_feat = cont_feat - c_mean.unsqueeze(-1).expand_as(cont_feat)
+
+        cont_conv = (cont_feat @ cont_feat.transpose(-1, -2)).div(cont_feat.shape[-1] - 1)  # interpolate Conv works well
+        inv_Lc = self.cholesky_dec(cont_conv, invert=True)  # interpolate L seems to be slightly better
+
+        whiten_c = inv_Lc @ cont_feat
+
+        # First interpolate between style_A, style_B, style_C, ...
+        mix_Ls = torch.zeros_like(inv_Lc)   # [B, N, N]
+        mix_s_mean = torch.zeros_like(c_mean)   # [B, N]
+        for styl_feat, alpha_s in zip(styl_feat_list, alpha_s_list):
+            assert styl_feat.shape[0] == B and styl_feat.shape[1] == N
+            styl_feat = styl_feat.reshape(B, N, -1)
+
+            if self.use_double:
+                styl_feat = styl_feat.double()
+
+            s_mean = torch.mean(styl_feat, -1)
+            styl_feat = styl_feat - s_mean.unsqueeze(-1).expand_as(styl_feat)
+
+            styl_conv = (styl_feat @ styl_feat.transpose(-1, -2)).div(styl_feat.shape[-1] - 1)  # interpolate Conv works well
+            Ls = self.cholesky_dec(styl_conv, invert=False)  # interpolate L seems to be slightly better
+
+            mix_Ls += Ls * alpha_s
+            mix_s_mean += s_mean * alpha_s
+
+        # Second interpolate between content and style_mix
+        if alpha_c != 0.0:
+            Lc = self.cholesky_dec(cont_conv, invert=False)
+            mix_Ls = mix_Ls * (1-alpha_c) + Lc * alpha_c
+            mix_s_mean = mix_s_mean * (1-alpha_c) + c_mean * alpha_c
+
+        color_fea = mix_Ls @ whiten_c
+        color_fea = color_fea + mix_s_mean.unsqueeze(-1).expand_as(color_fea)
+
+        if self.use_double:
+            color_fea = color_fea.to(in_dtype)
+
+        return color_fea.reshape(B, N, cH, cW)
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--mode', type=str, default='photorealistic')
-parser.add_argument('--ckpoint', type=str, default='checkpoints/photo_image.pt')
+if __name__ == '__main__':
+    # transfer
+    c = torch.rand((2, 16, 512, 256))
+    s = torch.rand((2, 16, 64, 128))
 
-# data
-parser.add_argument('--content', type=str, default='data/content/01.jpg')
-parser.add_argument('--style', type=str, default='data/style/01.jpg')
-
-parser.add_argument('--out_dir', type=str, default="output")
-parser.add_argument('--max_size', type=int, default=1280)
-parser.add_argument('--alpha_c', type=float, default=None)
-
-# segmentation
-parser.add_argument('--content_seg', type=str, default=None)
-parser.add_argument('--style_seg', type=str, default=None)
-parser.add_argument('--auto_seg', action='store_true', default=False)
-parser.add_argument('--save_seg_label', action='store_true', default=True)
-parser.add_argument('--save_seg_color', action='store_true', default=True)
-parser.add_argument('--label_mapping', type=str, default='models/segmentation/ade20k_semantic_rel.npy')
-parser.add_argument('--palette', type=str, default='models/segmentation/ade20k_palette.npy')
-parser.add_argument('--min_ratio', type=float, default=0.02)
-
-args = parser.parse_args()
-
-if not os.path.exists(args.out_dir):
-    os.makedirs(args.out_dir)
-out_dir = args.out_dir
+    cwct = cWCT(use_double=True)
+    cs = cwct.transfer(c, s)
+    print(cs.shape)
 
 
+    # interpolation
+    c = torch.rand((1, 16, 512, 256))
+    s_list = [torch.rand((1, 16, 64, 128)) for _ in range(4)]
+    alpha_s_list = [0.25 for _ in range(4)]     # interpolate between style_A, style_B, style_C, ...
+    alpha_c = 0.5   # interpolate between content and style_mix if alpha_c!=0.0
 
-# Reversible Network
-from models.RevResNet import RevResNet
-if args.mode.lower() == "photorealistic":
-    RevNetwork = RevResNet(nBlocks=[10, 10, 10], nStrides=[1, 2, 2], nChannels=[16, 64, 256], in_channel=3, mult=4, hidden_dim=16, sp_steps=2)
-elif args.mode.lower() == "artistic":
-    RevNetwork = RevResNet(nBlocks=[10, 10, 10], nStrides=[1, 2, 2], nChannels=[16, 64, 256], in_channel=3, mult=4, hidden_dim=64, sp_steps=1)
-else:
-    raise NotImplementedError()
-
-state_dict = torch.load(args.ckpoint)
-RevNetwork.load_state_dict(state_dict['state_dict'])
-RevNetwork = RevNetwork.to(device)
-RevNetwork.eval()
-
-
-# Transfer module
-from models.cWCT import cWCT
-cwct = cWCT()
-
-
-content = Image.open(args.content).convert('RGB')
-style = Image.open(args.style).convert('RGB')
-
-ori_csize = content.size
-
-content = img_resize(content, args.max_size, down_scale=RevNetwork.down_scale)
-style = img_resize(style, args.max_size, down_scale=RevNetwork.down_scale)
-
-
-# Segmentation
-if args.auto_seg:
-    # You can use any 'ade20k' segmentation model
-    # -----------------------------
-    # An example of using SegFormer
-    print("Building Segmentation Model SegFormer")
-    from mmseg.apis import inference_segmentor, init_segmentor
-    config = 'models/segmentation/SegFormer/local_configs/segformer/B5/segformer.b5.640x640.ade.160k.py'
-    checkpoint = 'models/segmentation/SegFormer/segformer.b5.640x640.ade.160k.pth'
-    seg_model = init_segmentor(config, checkpoint, device=device)
-
-    # Inference
-    content_BGR = np.array(content, dtype=np.uint8)[..., ::-1]
-    content_seg = inference_segmentor(seg_model, content_BGR)[0]  # shape:[H, W], value from 0 to 149 indicating the class of pixel
-    style_BGR = np.array(style, dtype=np.uint8)[..., ::-1]
-    style_seg = inference_segmentor(seg_model, style_BGR)[0]
-    # -----------------------------
-
-
-    # Post-processing segmentation results
-    from models.segmentation.SegReMapping import SegReMapping
-    label_remapping = SegReMapping(args.label_mapping, min_ratio=args.min_ratio)
-    content_seg = label_remapping.self_remapping(content_seg)  # eliminate noisy class
-    style_seg = label_remapping.self_remapping(style_seg)
-    content_seg = label_remapping.cross_remapping(content_seg, style_seg)
-    # style_seg = label_remapping.styl_merge(content_seg, style_seg)
-
-    content_seg = np.asarray(content_seg).astype(np.uint8)
-    style_seg = np.asarray(style_seg).astype(np.uint8)
-
-    # Save the class label of segmentation results
-    if args.save_seg_label:
-        if not os.path.exists(os.path.join(out_dir, "segmentation")):
-            os.makedirs(os.path.join(out_dir, "segmentation"))
-        Image.fromarray(content_seg).save(os.path.join(out_dir, "segmentation", 'content_seg_label.png'))
-        Image.fromarray(style_seg).save(os.path.join(out_dir, "segmentation", 'style_seg_label.png'))
-
-    # Save the visualization of segmentation results
-    if args.save_seg_color:
-        palette = np.load(args.palette)
-        content_seg_color = np.zeros((content_seg.shape[0], content_seg.shape[1], 3), dtype=np.uint8)
-        for label, color in enumerate(palette):
-            content_seg_color[content_seg == label, :] = color  # RGB
-        Image.fromarray(content_seg_color).save(os.path.join(out_dir, "segmentation", 'content_seg_color.png'))
-
-        style_seg_color = np.zeros((style_seg.shape[0], style_seg.shape[1], 3), dtype=np.uint8)
-        for label, color in enumerate(palette):
-            style_seg_color[style_seg == label, :] = color  # RGB
-        Image.fromarray(style_seg_color).save(os.path.join(out_dir, "segmentation", 'style_seg_color.png'))
-
-    content_seg = content_seg[None, ...]    # shape: [B, H, W]
-    style_seg = style_seg[None, ...]
-
-elif args.content_seg is not None and args.style_seg is not None:
-    content_seg = load_segment(args.content_seg, content.size)
-    style_seg = load_segment(args.style_seg, style.size)
-    content_seg = content_seg[None, ...]     # shape: [B, H, W]
-    style_seg = style_seg[None, ...]
-else:
-    content_seg = None     # default
-    style_seg = None     # default
-
-
-content = transforms.ToTensor()(content).unsqueeze(0).to(device)
-style = transforms.ToTensor()(style).unsqueeze(0).to(device)
-
-
-# Stylization
-with torch.no_grad():
-    # Forward inference
-    z_c = RevNetwork(content, forward=True)
-    z_s = RevNetwork(style, forward=True)
-
-    # Transfer
-    if args.alpha_c is not None and content_seg is None and style_seg is None:
-        # interpolation between content and style, mask is not supported
-        assert 0.0 <= args.alpha_c <= 1.0
-        z_cs = cwct.interpolation(z_c, styl_feat_list=[z_s], alpha_s_list=[1.0], alpha_c=args.alpha_c)
-    else:
-        z_cs = cwct.transfer(z_c, z_s, content_seg, style_seg)
-
-    # Backward inference
-    stylized = RevNetwork(z_cs, forward=False)
-
-
-# save stylized
-if not os.path.exists(out_dir):
-    os.makedirs(out_dir)
-cn = os.path.basename(args.content)
-sn = os.path.basename(args.style)
-file_name = "%s_%s.png" % (cn.split(".")[0], sn.split(".")[0])
-path = os.path.join(out_dir, file_name)
-
-# stylized = transforms.Resize((ori_csize[1], ori_csize[0]), interpolation=Image.BICUBIC)(stylized)    # Resize to original size
-grid = utils.make_grid(stylized.data, nrow=1, padding=0)
-ndarr = grid.mul(255).clamp(0, 255).byte().permute(1, 2, 0).cpu().numpy()
-out_img = Image.fromarray(ndarr)
-
-out_img.save(path, quality=100)
-print("Save at %s" % path)
-
+    cwct = cWCT(use_double=True)
+    cs = cwct.interpolation(c, s_list, alpha_s_list, alpha_c)
+    print(cs.shape)
