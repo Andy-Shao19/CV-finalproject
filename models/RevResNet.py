@@ -268,13 +268,14 @@ class RevResNet(nn.Module):
         self.eval()
         x_cs, x_c_cyc = [], []
         for i in range(x_c.size(0)):
-            z_c = self(x_c[i].unsqueeze(0).to(device))
-            z_s = self(x_s[i].unsqueeze(0).to(device))
-
+            z_c,mid_z_c = self(x_c[i].unsqueeze(0).to(device))
+            z_s,mid_z_s = self(x_s[i].unsqueeze(0).to(device))
+            mid_z_cs = transfer_module.transfer(mid_z_c, mid_z_s)
             z_cs = transfer_module.transfer(z_c, z_s)
+            z_cs = z_cs+0.05*mid_z_cs
             stylized = self(z_cs, forward=False)
 
-            z_cs = self(stylized)
+            z_cs,_ = self(stylized)
             z_csc = transfer_module.transfer(z_cs, z_c)
             rec_csc = self(z_csc, forward=False)
 

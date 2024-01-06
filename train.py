@@ -146,22 +146,23 @@ while current_iter < total_iterations:
     optimizer.zero_grad()
 
     # Forward inference
-    z_c = RevNetwork(images_a, forward=True)
-    z_s = RevNetwork(images_b, forward=True)
+    z_c, mid_z_c = RevNetwork(images_a, forward=True)
+    z_s, mid_z_s = RevNetwork(images_b, forward=True)
 
     # Transfer
+    mid_z_cs = cwct.transfer(mid_z_c, mid_z_s)
     z_cs = cwct.transfer(z_c, z_s)
-
+    z_cs = z_cs + 0.05*mid_z_cs
     # Backward inference
     stylized = RevNetwork(z_cs, forward=False)
 
-
+    # print('stylized shape', stylized.size())
     # Style loss
     loss_c, loss_s = vgg_enc(images_a, images_b, stylized, n_layer=4, content_weight=args.content_weight)
 
     # Cycle reconstruction
     if args.rec_weight > 0:
-        z_cs = RevNetwork(stylized, forward=True)
+        z_cs,_ = RevNetwork(stylized, forward=True)
         z_csc = cwct.transfer(z_cs, z_c)
         rec = RevNetwork(z_csc, forward=False)
         loss_rec = l1_loss(rec, images_a)
@@ -189,7 +190,7 @@ while current_iter < total_iterations:
     # Temporal loss
     if args.temporal_weight > 0 and current_iter > args.training_iterations:
         SecondFrame, ForwardFlow = Temporal_loss.GenerateFakeData(images_a)
-        z_c2 = RevNetwork(SecondFrame, forward=True)
+        z_c2,_ = RevNetwork(SecondFrame, forward=True)
         z_cs2 = cwct.transfer(z_c2, z_s)
         stylizedSecondFrame = RevNetwork(z_cs2, forward=False)
 
