@@ -23,7 +23,6 @@ parser.add_argument('--style', type=str, default='data/style/03.jpeg')
 parser.add_argument('--out_dir', type=str, default="output")
 parser.add_argument('--max_size', type=int, default=1280)
 parser.add_argument('--alpha_c', type=float, default=None)
-parser.add_argument('--fps', type=int, default=10)
 
 
 
